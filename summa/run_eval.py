@@ -50,9 +50,9 @@ def generate_summaries_or_translations(
         prefix = prefix or getattr(model.config, "prefix", "") or ""
     for examples_chunk in tqdm(list(chunks(examples, batch_size))):
         examples_chunk = [prefix + text for text in examples_chunk]
-        batch = tokenizer(examples_chunk, return_tensors="pt", truncation=True, padding="longest").to(device)
-        #print(len(tokenizer))
-        #print(batch.input_ids.size(), batch.input_ids.max(), batch.input_ids.min())
+        batch = tokenizer(examples_chunk, return_tensors="pt", truncation=True, padding="max_length", max_length=1024).to(device)
+        print(len(tokenizer))
+        print(batch.input_ids.size(), batch.input_ids.max(), batch.input_ids.min())
         summaries = model.generate(
             input_ids=batch.input_ids,
             attention_mask=batch.attention_mask,
@@ -63,6 +63,78 @@ def generate_summaries_or_translations(
             fout.write(hypothesis.lstrip() + "\n")
             fout.flush()
     fout.close()
+    runtime = int(time.time() - start_time)  # seconds
+    n_obs = len(examples)
+    return dict(n_obs=n_obs, runtime=runtime, seconds_per_sample=round(runtime / n_obs, 4))
+
+
+def get_logits_and_labels(
+    examples: List[str],
+    targets: List[str],
+    save_path: str,
+    model_name: str,
+    batch_size: int = 8,
+    device: str = DEFAULT_DEVICE,
+    fp16=False,
+    task="summarization",
+    prefix=None,
+    **generate_kwargs,
+):
+    """Save model.generate results to <out_file>, and return how long it took."""
+    # fout = Path(out_file).open("w", encoding="utf-8") # just the folder
+    model_name = str(model_name)
+    model = AutoModelForSeq2SeqLM.from_pretrained(model_name).to(device)
+    if fp16:
+        model = model.half()
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    print(f"Inferred tokenizer type: {tokenizer.__class__}")  # if this is wrong, check config.model_type.
+    print(model.model.encoder.embed_tokens.weight.size())
+
+    confidences_list = [] # model confidence for top-1 prediction
+    predictions_list = [] # model top-1 prediction
+    targets_list = [] # tokenized target summarizations
+
+    start_time = time.time()
+    # update config with task specific params
+    use_task_specific_params(model, task)
+    if prefix is None:
+        prefix = prefix or getattr(model.config, "prefix", "") or ""
+    for examples_chunk in tqdm(list(chunks(examples, batch_size))):
+        examples_chunk = [prefix + text for text in examples_chunk]
+        batch = tokenizer(examples_chunk, return_tensors="pt", truncation=True, padding="max_length", max_length=1024).to(device)
+        # print(len(tokenizer))
+        # print(batch.input_ids.size(), batch.input_ids.max(), batch.input_ids.min())
+        with torch.no_grad():
+            logits = model(input_ids=batch.input_ids, attention_mask=batch.attention_mask).logits
+        softmaxes = torch.nn.functional.softmax(logits, dim=-1)
+        conf, pred = torch.max(softmaxes, dim=-1)
+        print(conf.shape)
+        print(pred.shape)
+        confidences_list.append(conf)
+        predictions_list.append(pred)
+        
+    for targets_chunk in tqdm(list(chunks(targets, batch_size))):
+        batch = tokenizer(targets_chunk, return_tensors="pt", truncation=True, padding="max_length", max_length=1024).to(device)
+        tokenized_targets = batch.input_ids
+        print(tokenized_targets.shape)
+        targets_list.append(tokenized_targets)
+
+    confidences = torch.cat(confidences_list, 0)
+    predictions = torch.cat(predictions_list, 0)
+    targets = torch.cat(targets_list, 0)
+
+    print(confidences.shape)
+    print(predictions.shape)
+    print(targets.shape)
+
+    save_path = Path(save_path)
+    save_path.mkdir(parents=True, exist_ok=True)
+    torch.save(confidences.cpu().detach(), save_path / 'confidences.pt')
+    torch.save(predictions.cpu().detach(), save_path / 'predictions.pt')
+    torch.save(targets.cpu().detach(), save_path / 'targets.pt')
+
+
     runtime = int(time.time() - start_time)  # seconds
     n_obs = len(examples)
     return dict(n_obs=n_obs, runtime=runtime, seconds_per_sample=round(runtime / n_obs, 4))
@@ -118,13 +190,16 @@ def run_generate(verbose=True):
     if parsed_args and verbose:
         print(f"parsed the following generate kwargs: {parsed_args}")
     examples = [" " + x.rstrip() if "t5" in args.model_name else x.rstrip() for x in open(args.input_path).readlines()]
+    targets = [" " + x.rstrip() if "t5" in args.model_name else x.rstrip() for x in open(args.reference_path).readlines()]
     if args.n_obs > 0:
         examples = examples[: args.n_obs]
+        targets = targets[: args.n_obs]
     Path(args.save_path).parent.mkdir(exist_ok=True)
     if args.reference_path is None and Path(args.score_path).exists():
         warnings.warn(f"score_path {args.score_path} will be overwritten unless you type ctrl-c.")
-    runtime_metrics = generate_summaries_or_translations(
+    runtime_metrics = get_logits_and_labels(
         examples,
+        targets,
         args.save_path,
         args.model_name,
         batch_size=args.bs,
@@ -139,11 +214,11 @@ def run_generate(verbose=True):
         return {}
 
     # Compute scores
-    score_fn = calculate_bleu if "translation" in args.task else calculate_rouge
-    output_lns = [x.rstrip() for x in open(args.save_path).readlines()]
-    reference_lns = [x.rstrip() for x in open(args.reference_path).readlines()][: len(output_lns)]
-    scores: dict = score_fn(output_lns, reference_lns)
-    scores.update(runtime_metrics)
+    # score_fn = calculate_bleu if "translation" in args.task else calculate_rouge
+    # output_lns = [x.rstrip() for x in open(args.save_path).readlines()]
+    # reference_lns = [x.rstrip() for x in open(args.reference_path).readlines()][: len(output_lns)]
+    # scores: dict = score_fn(output_lns, reference_lns)
+    # scores.update(runtime_metrics)
 
     if args.dump_args:
         scores.update(parsed_args)
