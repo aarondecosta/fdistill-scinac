@@ -40,10 +40,12 @@ export MODEL_NAME=xsum_student_init_model/best_tfmr
 echo $MODEL_NAME
 export BEAM=6
 export SAVE_PATH=runs/pred-$(date +%m-%d-%y--%T)-teacher-eval
+export LOAD_PATH=runs/pred-12-08-24--23:43:49-teacher-eval
 
 python3 run_eval.py \
   --model_name $MODEL_NAME \
   --input_path xsum/test.source \
+  --load_path $LOAD_PATH/ \
   --save_path $SAVE_PATH/ \
   --reference_path xsum/test.target \
   --score_path $SAVE_PATH/metrics.json \

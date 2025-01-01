@@ -56,18 +56,51 @@ def get_logits_and_labels(
         prefix = prefix or getattr(model.config, "prefix", "") or ""
     for examples_chunk in tqdm(list(chunks(examples, batch_size))):
         examples_chunk = [prefix + text for text in examples_chunk]
-        batch = tokenizer(examples_chunk, return_tensors="pt", truncation=True, padding="max_length", max_length=1024).to(device)
+        batch = tokenizer(examples_chunk, return_tensors="pt", truncation=True, padding="longest").to(device)
         # print(len(tokenizer))
         # print(batch.input_ids.size(), batch.input_ids.max(), batch.input_ids.min())
-        with torch.no_grad():
-            logits = model(input_ids=batch.input_ids, attention_mask=batch.attention_mask).logits
+        # with torch.no_grad():
+        #     logits = model(input_ids=batch.input_ids, attention_mask=batch.attention_mask).logits
+        output = model.generate(
+            input_ids=batch.input_ids,
+            attention_mask=batch.attention_mask,
+            max_new_tokens=50,
+            num_return_sequences=1,
+            return_dict_in_generate=True,
+            output_scores=True,
+            **generate_kwargs,
+        )
+        sequences = output.sequences
+        # num_beams = generate_kwargs.get("num_beams", 6)
+        # sequence_scores = torch.stack(output.sequence_scores, dim=1)
+        # best_beam_idx = torch.argmax(sequence_scores, dim=1)
+        logits = torch.stack(output.scores, dim=1)
+        # logits = logits.view(batch_size, num_beams, -1, logits.size(-1))
+        # logits = logits[:,best_beam_idx,:,:]
+        print(logits.shape)
+
+        # pad logits to max_new_tokens
+        max_len = 50
+        pad_len = max_len - logits.size(1)
+        if pad_len > 0:
+            padding = torch.zeros(logits.shape[0], pad_len, logits.shape[2], device=logits.device)
+            pad_token_id = tokenizer.pad_token_id
+            pad_logits = torch.full_like(padding, float('-inf'))
+            pad_logits[:,:,pad_token_id] = float('inf')
+            logits = torch.cat([logits, pad_logits], dim=1)
+
+        print(logits.shape)
+
         softmaxes = torch.nn.functional.softmax(logits, dim=-1)
         conf, pred = torch.max(softmaxes, dim=-1)
+        print(conf.shape)
+        print(pred.shape)
+        print()
         confidences_list.append(conf)
         predictions_list.append(pred)
         
     for targets_chunk in tqdm(list(chunks(targets, batch_size))):
-        batch = tokenizer(targets_chunk, return_tensors="pt", truncation=True, padding="max_length", max_length=1024).to(device)
+        batch = tokenizer(targets_chunk, return_tensors="pt", truncation=True, padding="max_length", max_length=50).to(device)
         tokenized_targets = batch.input_ids
         # print(tokenized_targets.shape)
         targets_list.append(tokenized_targets)
@@ -82,14 +115,15 @@ def get_logits_and_labels(
 
     save_path = Path(save_path)
     save_path.mkdir(parents=True, exist_ok=True)
-    torch.save(confidences.cpu().detach(), save_path / 'confidences.pt')
-    torch.save(predictions.cpu().detach(), save_path / 'predictions.pt')
-    torch.save(targets.cpu().detach(), save_path / 'targets.pt')
+    torch.save(confidences.cpu().detach(), save_path / "confidences.pt")
+    torch.save(predictions.cpu().detach(), save_path / "predictions.pt")
+    torch.save(targets.cpu().detach(), save_path / "labels.pt")
 
 
     runtime = int(time.time() - start_time)  # seconds
     n_obs = len(examples)
     return dict(n_obs=n_obs, runtime=runtime, seconds_per_sample=round(runtime / n_obs, 4))
+
 
 
 def datetime_now():
@@ -99,17 +133,11 @@ def datetime_now():
 def run_generate(verbose=True):
     """
 
-    Takes input text, generates output, and then using reference calculates the BLEU scores.
-
-    The results are saved to a file and returned to the caller, and printed out unless ``verbose=False`` is passed.
+    Takes input text, calculates confidences and predictions for generation, and saves as pytorch tensors.
 
     Args:
         verbose (:obj:`bool`, `optional`, defaults to :obj:`True`): print results to stdout
-
-    Returns:
-        a tuple: ``(scores, params}``
-        - ``scores``: a dict of scores data ``{'bleu': 39.6501, 'n_obs': 2000, 'runtime': 186, 'seconds_per_sample': 0.093}``
-        - ``params``: a dict of custom params, e.g. ``{'num_beams': 5, 'length_penalty': 0.8}``
+        
     """
 
     parser = argparse.ArgumentParser()

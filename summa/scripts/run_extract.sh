@@ -41,7 +41,7 @@ echo $MODEL_NAME
 export BEAM=6
 export SAVE_PATH=runs/pred-$(date +%m-%d-%y--%T)-teacher-eval
 
-python3 run_eval.py \
+python3 run_extract.py \
   --model_name $MODEL_NAME \
   --input_path xsum/test.source \
   --save_path $SAVE_PATH/ \
